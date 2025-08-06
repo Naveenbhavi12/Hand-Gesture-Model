@@ -1,0 +1,225 @@
+import cv2
+import mediapipe as mp
+import pyautogui
+import time
+import math
+from pynput.keyboard import Controller as KeyboardController, Key
+from ctypes import windll
+from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+from comtypes import CLSCTX_ALL
+import json
+import os
+
+# Initialize modules
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(max_num_hands=2)
+mp_draw = mp.solutions.drawing_utils
+keyboard = KeyboardController()
+
+# Audio control setup
+devices = AudioUtilities.GetSpeakers()
+interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+volume = interface.QueryInterface(IAudioEndpointVolume)
+
+# Screen size
+screen_w, screen_h = pyautogui.size()
+
+# Webcam
+cap = cv2.VideoCapture(0)
+
+# Load config (or default)
+CONFIG_PATH = "gesture_config.json"
+default_config = {
+    "cursor_sensitivity": 1.0,
+    "click_cooldown": 1.0,
+    "drag_threshold": 0.5,
+    "scroll_sensitivity": 60,
+    "volume_sensitivity": 300,
+    "zoom_sensitivity": 2,
+    "mode_order": ["POINTER", "SCROLL", "VOLUME", "ZOOM"]
+}
+
+if os.path.exists(CONFIG_PATH):
+    with open(CONFIG_PATH, 'r') as f:
+        config = json.load(f)
+else:
+    config = default_config
+
+# State variables
+mode_index = 0
+mode_list = config["mode_order"]
+mode = mode_list[mode_index]
+
+prev_fist_time = 0
+last_click_time = 0
+dragging = False
+pinch_start_time = None
+prev_scroll_y = None
+
+# Declare once at top outside the loop
+initial_volume_y = None
+initial_zoom_y = None
+
+# Color dictionary for modes
+mode_colors = {
+    "POINTER": (255, 0, 0),   # Blue
+    "SCROLL": (0, 255, 255),  # Yellow
+    "VOLUME": (0, 255, 255),  # Cyan
+    "ZOOM": (0, 165, 255),    # Orange
+}
+
+# Utility functions
+def get_distance(a, b):
+    return math.hypot(a.x - b.x, a.y - b.y)
+
+def is_fist(landmarks):
+    tips = [8, 12, 16, 20]  # Index, middle, ring, pinky
+    return all(landmarks[tip].y > landmarks[tip - 2].y for tip in tips)
+
+def get_screen_pos(x, y, frame_w, frame_h):
+    screen_x = int(min(max((x / frame_w) * screen_w, 0), screen_w - 1))
+    screen_y = int(min(max((y / frame_h) * screen_h, 0), screen_h - 1))
+    return screen_x, screen_y
+
+while True:
+    ret, img = cap.read()
+    if not ret:
+        break
+
+    img = cv2.flip(img, 1)
+    frame_h, frame_w, _ = img.shape
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    result = hands.process(rgb)
+
+    if not result.multi_hand_landmarks:
+        initial_zoom_y = None
+        initial_volume_y = None
+        prev_scroll_y = None
+        pinch_start_time = None
+        if dragging:
+            pyautogui.mouseUp()
+            dragging = False
+
+    gesture_feedback = ""
+
+    if result.multi_hand_landmarks and result.multi_handedness:
+        fist_detected = False
+
+        for hand_landmarks, hand_handedness in zip(result.multi_hand_landmarks, result.multi_handedness):
+            hand_label = hand_handedness.classification[0].label  # 'Left' or 'Right'
+            lm = hand_landmarks.landmark
+
+            mp_draw.draw_landmarks(img, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+
+            if hand_label == "Right":
+                index_tip, middle_tip, thumb_tip = lm[8], lm[12], lm[4]
+
+                # Cursor movement (middle finger)
+                cx, cy = get_screen_pos(lm[12].x * frame_w, lm[12].y * frame_h, frame_w, frame_h)
+                screen_x = int(cx * config["cursor_sensitivity"])
+                screen_y = int(cy * config["cursor_sensitivity"])
+                pyautogui.moveTo(screen_x, screen_y, duration=0.01)
+
+                dist_thumb_index = get_distance(thumb_tip, index_tip)
+                dist_thumb_middle = get_distance(thumb_tip, middle_tip)
+
+                # Left Click / Drag
+                if dist_thumb_index < 0.04:
+                    if pinch_start_time is None:
+                        pinch_start_time = time.time()
+                    elif time.time() - pinch_start_time > config["drag_threshold"]:
+                        if not dragging:
+                            pyautogui.mouseDown()
+                            dragging = True
+                        gesture_feedback = "Dragging"
+                else:
+                    if dragging:
+                        pyautogui.mouseUp()
+                        dragging = False
+                        gesture_feedback = "Drag Released"
+                    elif pinch_start_time and time.time() - pinch_start_time <= config["drag_threshold"]:
+                        if time.time() - last_click_time > config["click_cooldown"]:
+                            pyautogui.click()
+                            last_click_time = time.time()
+                            gesture_feedback = "Left Click"
+                    pinch_start_time = None
+
+                if dist_thumb_middle < 0.04 and time.time() - last_click_time > config["click_cooldown"]:
+                    pyautogui.click(button='right')
+                    last_click_time = time.time()
+                    gesture_feedback = "Right Click"
+
+            elif hand_label == "Left":
+                if is_fist(lm):
+                    fist_detected = True
+
+                index_tip, middle_tip = lm[8], lm[12]
+
+                if mode == "SCROLL":
+                    ix, iy = get_screen_pos(index_tip.x * frame_w, index_tip.y * frame_h, frame_w, frame_h)
+                    mx, my = get_screen_pos(middle_tip.x * frame_w, middle_tip.y * frame_h, frame_w, frame_h)
+                    scroll_distance = math.hypot(ix - mx, iy - my)
+                    is_scrolling = scroll_distance < 40
+
+                    if is_scrolling:
+                        current_scroll_y = (iy + my) // 2
+                        if prev_scroll_y is not None:
+                            dy = current_scroll_y - prev_scroll_y
+                            if dy > 5:
+                                pyautogui.scroll(-config["scroll_sensitivity"])
+                                gesture_feedback = "Scroll Down"
+                            elif dy < -5:
+                                pyautogui.scroll(config["scroll_sensitivity"])
+                                gesture_feedback = "Scroll Up"
+                        prev_scroll_y = current_scroll_y
+                    else:
+                        prev_scroll_y = None
+
+                elif mode == "VOLUME":
+                    cy = int(lm[12].y * frame_h)
+                    if initial_volume_y is None:
+                        initial_volume_y = cy
+                    else:
+                        diff = initial_volume_y - cy
+                        current_vol = volume.GetMasterVolumeLevelScalar()
+                        new_vol = max(0.0, min(1.0, current_vol + diff / config["volume_sensitivity"]))
+                        volume.SetMasterVolumeLevelScalar(new_vol, None)
+                        gesture_feedback = f"Volume: {int(new_vol * 100)}%"
+                        initial_volume_y = cy
+
+                elif mode == "ZOOM":
+                    cy = int(lm[12].y * frame_h)
+                    if initial_zoom_y is None:
+                        initial_zoom_y = cy
+                    else:
+                        diff = initial_zoom_y - cy
+                        keyboard.press(Key.ctrl)
+                        pyautogui.scroll(int(diff * config["zoom_sensitivity"]))
+                        keyboard.release(Key.ctrl)
+                        gesture_feedback = "Zooming"
+                        initial_zoom_y = cy
+
+        if fist_detected:
+            now = time.time()
+            if now - prev_fist_time > 1.5:
+                mode_index = (mode_index + 1) % len(mode_list)
+                mode = mode_list[mode_index]
+                prev_fist_time = now
+                initial_volume_y = None
+                initial_zoom_y = None
+                prev_scroll_y = None
+                pinch_start_time = None
+
+    # HUD
+    color = mode_colors.get(mode, (255, 255, 255))
+    cv2.rectangle(img, (10, 10), (370, 160), (0, 0, 0), -1)
+    cv2.putText(img, f"Mode: {mode}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+    if gesture_feedback:
+        cv2.putText(img, gesture_feedback, (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (180, 255, 180), 2)
+
+    cv2.imshow("Multi-Hand Gesture Controller", img)
+    if cv2.waitKey(1) & 0xFF == 27:
+        break
+
+cap.release()
+cv2.destroyAllWindows()
